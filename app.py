@@ -1,11 +1,12 @@
 import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import streamlit as st
 import cv2
 from PIL import Image, ImageOps
 import numpy as np
 import faiss
 import torch
-import torchvision.transforms as transforms
+import torchvision.transforms as T
 from facenet_pytorch import InceptionResnetV1
 import time
 import matplotlib.pyplot as plt
@@ -16,70 +17,138 @@ import plotly.graph_objects as go
 import base64
 from io import BytesIO
 
-st.set_page_config(page_title='Employee Checkin Dashboard', layout='wide')
 
+# Page Configuration
+st.set_page_config(page_title="Employee Dashboard", page_icon="🧑‍💼", layout="wide")
+st.markdown("""
+    <style>
+        .employee-card {
+            padding: 15px;
+            border-radius: 10px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            margin-bottom: 15px;
+            transition: all 0.3s ease;
+        }
+        .employee-card:hover {
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+        .match-container {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin: 20px 0;
+            gap: 20px;
+        }
+        .vector-space {
+            background-color: #f8f9fa;
+            border-radius: 10px;
+            padding: 20px;
+            margin-top: 20px;
+        }
+        
+        .top-matches {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr); /* Two columns */
+            gap: 15px;
+            padding: 10px 0;
+        }
+
+        .match-item {
+            text-align: center;
+        }
+        .status-badge {
+            padding: 5px 10px;
+            border-radius: 20px;
+            font-weight: bold;
+            font-size: 0.8em;
+        }
+        .checked-in {
+            background-color: #d4edda;
+            color: #155724;
+            margin: 0 0 20px 0;
+        }
+        .not-checked {
+            background-color: #f8d7da;
+            color: #721c24;
+            margin: 0 0 20px 0;
+        }
+    </style>
+""", unsafe_allow_html=True)
+
+st.markdown("<h1 style='text-align: center;'>🧑‍💼 Face-Based Employee Check-in System</h1>", unsafe_allow_html=True)
+
+# Functional Code
 @st.cache_resource
 def load_facenet_model():
-  return InceptionResnetV1(pretrained='vggface2').eval()
+    """Loads the pre-trained InceptionResnetV1 model."""
+    return InceptionResnetV1(pretrained='vggface2').eval()
 
 @st.cache_resource
 def load_faiss_index():
-  if not os.path_exists('facenet_features.index') or not os.path.exists('facenet_label_map.npy'):
-    st.error('Faiss index or label map not found!')
-    return None, None, None
+    """Loads the FAISS index and label map."""
+    if not os.path.exists("facenet_features.index") or not os.path.exists("facenet_label_map.npy"):
+        st.error("Faiss index or label map not found.")
+        return None, None, None
+    
+    index = faiss.read_index("facenet_features.index")
+    label_map = np.load("facenet_label_map.npy")
+    
+    embeddings = index.reconstruct_n(0, index.ntotal)
+    
+    return index, label_map, embeddings
 
-  index = faiss.read_index('facenet_features.index')
-  label_map = np.load('facenet_label_map.npy')
-
-  embeddings = index.reconstruct_n(0, index.ntotal)
-  return index, label_map, embeddings
-
-facenet_model = load_facenet_model()
-index, label_map, embeddings = load_faiss_index()
+# @st.cache_resource
 
 
-transforms = transforms.Compose([
-    transforms.Resize((160, 160)), #facenet expected input size
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+
+face_recognition_model = load_facenet_model()
+index, label_map, all_embeddings = load_faiss_index()
+
+transform = T.Compose([
+    T.Resize((160, 160)),  # Facenet's expected input size
+    T.ToTensor(),
+    T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 ])
 
-
-def crop_center_square(img):
-  """Crop center square of img and resize to 300 * 300 """
-  width, height = img.size
-  size = min(width, height)
-  left = (width - size) / 2
-  top = (height - size) / 2
-  right = (width + size) / 2
-  bottom = (height + size) / 2
-
-  img = img.crop((left, top, right, bottom))
-  img = img.resize((300, 300))
-  return img
+def crop_center_square(image):
+    """Crop the center square of an image and resize to 300x300."""
+    width, height = image.size
+    size = min(width, height)
+    left = (width - size) / 2
+    top = (height - size) / 2
+    right = (width + size) / 2
+    bottom = (height + size) / 2
+    
+    # Crop the center of the image
+    image = image.crop((left, top, right, bottom))
+    
+    # Resize to 300x300
+    image = image.resize((300, 300))
+    
+    return image
 
 def image_to_feature(image, model):
-  img = image.convert('RGB')
-  img_tensor = transform(img).unsqueeze(0)
+    """Convert image to face embedding using a pre-trained model."""
+    img = image.convert('RGB')
+    img_tensor = transform(img).unsqueeze(0)  # Add batch dimension
+    with torch.no_grad():  # Disable gradient calculation
+        embedding = model(img_tensor)
+    return embedding.squeeze().numpy()
 
-  with torch.no_grad():
-    embedding = model(img_tensor)
-  return embedding.squeeze().numpy()
-
-def search_similar_images(query_feature, k=5, threshold=0.3):
-  if index is None or label_map is None:
-    return []
-
-  similarities, indices = index.search(np.array([query_feature]), k)
-  results = []
-
-  for i in range(len(indices[0])):
-    similarity = similarities[0][i]
-    if similarity > threshold:
-      employee_name = label_map[indices[0][i]]
-      results.append((employee_name, similarity, indices[0][i]))
-
-  return results
+def search_similar_features(query_feature, k=5, threshold=0.3):
+    if index is None or label_map is None:
+        return []
+    
+    # Search the index
+    similarities, indices = index.search(np.array([query_feature]), k)
+    
+    results = []
+    for i in range(len(indices[0])):
+        similarity = similarities[0][i]
+        if similarity > threshold:
+            employee_name = label_map[indices[0][i]]
+            results.append((employee_name, similarity, indices[0][i]))
+    return results
 
 
 def visualize_embeddings(query_embedding=None, matches=None):
@@ -130,6 +199,8 @@ def visualize_embeddings(query_embedding=None, matches=None):
     # Reduce dimensionality with t-SNE (3D)
     # tsne = TSNE(n_components=3, random_state=42, perplexity=perplexity)
     # embeddings_3d = tsne.fit_transform(embeddings_to_plot)
+    
+    from sklearn.decomposition import PCA
 
     pca = PCA(n_components=3, random_state=42)
     embeddings_3d = pca.fit_transform(embeddings_to_plot)
@@ -222,35 +293,35 @@ def visualize_embeddings(query_embedding=None, matches=None):
         df_matches = pd.DataFrame(match_data)
         st.dataframe(df_matches.style.highlight_max(subset=["Similarity"], color='lightgreen'), 
                     use_container_width=True)
-
-
-def get_avatar_image(employee_name):
-    avatar_path_jpg = f"./Dataset/Avatar_{employee_name}.jpg"
-    avatar_path_JPG = f"./Dataset/Avatar_{employee_name}.JPG"
-
-    if os.path.exists(avatar_path_jpg):
-      return avatar_path_jpg
-    elif os.path.exists(avatar_path_JPG):
-      return avatar_path_JPG
-    else:
-      return None
     
 
+def get_avatar_image(employee_name):
+    """Get avatar image path for an employee."""
+    avatar_path_jpg = f"./Dataset/Avatar_{employee_name}.jpg"
+    avatar_path_JPG = f"./Dataset/Avatar_{employee_name}.JPG"
+    
+    if os.path.exists(avatar_path_jpg):
+        return avatar_path_jpg
+    elif os.path.exists(avatar_path_JPG):
+        return avatar_path_JPG
+    else:    
+        return "https://via.placeholder.com/300?text=No+Photo"
+
 # State management
-if 'checkin_status' not in st.session_state:
-  if label_map is not None:
-    st.session_state.checkin_status = {name: False for name in label_map}
-  else:
-    st.session_state.checkin_status = {}
+if "checkin_status" not in st.session_state:
+    if label_map is not None:
+        st.session_state.checkin_status = {name: False for name in label_map}
+    else:
+        st.session_state.checkin_status = {}
 
-if 'captured_img' not in st.session_state:
-  st.session_state.captured_img = None
+if "captured_image" not in st.session_state:
+    st.session_state.captured_image = None
 
-if 'matching_result' not in st.session_state:
-  st.session_state.matching_result = None
+if "matching_result" not in st.session_state:
+    st.session_state.matching_result = None
 
-if 'matching_distance' not in st.session_state:
-  st.session_state.matching_distance = None
+if "matching_distance" not in st.session_state:
+    st.session_state.matching_distance = None
 
 if "matching_avatar" not in st.session_state:
     st.session_state.matching_avatar = None
@@ -261,30 +332,38 @@ if "query_embedding" not in st.session_state:
 if "all_matches" not in st.session_state:
     st.session_state.all_matches = []
 
+# Main Layout
+col1, col2 = st.columns([3, 2])
 
-def main():
-  col1, col2 = st.columns([3, 2])
-  with col1:
-    st.markdown('### Employee List')
+with col1:
+    # Employee List Section
+    st.markdown("### 👥 Employee List")
     
     if not st.session_state.checkin_status:
-      st.warning('No employee data available')
+        st.warning("No employee data available. Please ensure the database is properly set up.")
     else:
-      cols = st.columns(3)
-      for i, (name, checked) in enumerate(st.session_state.checkin_status.items()):
-          with cols[i % 3]:
-              avatar = get_avatar_image(name)
-              print(avatar, i)
-              status_class = "checked-in" if checked else "not-checked"
-              status_text = "CHECKED IN" if checked else "NOT CHECKED"
-              image = Image.open(avatar)
+        # Create a grid of employee cards
+        cols = st.columns(3)
+        for i, (name, checked) in enumerate(st.session_state.checkin_status.items()):
+            with cols[i % 3]:
+                avatar = get_avatar_image(name)
+                print(avatar, i)
+                status_class = "checked-in" if checked else "not-checked"
+                status_text = "CHECKED IN" if checked else "NOT CHECKED"
+                image = Image.open(avatar)
                 
-              image = image.resize((300, 300))
+                image = image.resize((300, 300))
                 
-              st.image(image, use_container_width=True)
+                st.image(image, use_container_width=True)
 
+                st.markdown(f"""
+                    <div style="text-align:center;">
+                        <h4>{name}</h4>
+                        <div class="status-badge {status_class}">{status_text}</div>
+                    </div>
+                """, unsafe_allow_html=True)
 
-  with col2:
+with col2:
     # Check-in Section
     st.markdown("### 📸 Employee Check-in")
     
@@ -413,4 +492,4 @@ def main():
             )
         elif st.session_state.matching_result is None and st.session_state.all_matches:
             st.error("No matches found above the confidence threshold.")
-            visualize_embeddings(st.session_state.query_embedding) 
+            visualize_embeddings(st.session_state.query_embedding)
